@@ -1,0 +1,102 @@
+How to get your sunrise connection working via a media-converter rather than being forced to
+use your sunrise internet box.
+
+
+1. Basic connectivity
+
+I use a TP-Link MC220L to convert between fiber and Cat6 ethernet.
+
+You will need to ask on VLAN10 for an IP address, supplying a Sunrise DHCP option:
+
+vconfig eth0 10
+dhcpcd -4 -t 40 -v 60,dslforum.org,Fast5360-sunrise -G eth0.10
+
+
+2. VoIP
+
+I couldn't find a way to get the VoIP account password from sunrise, so I just
+stuck the internet box on VLAN10 off eth1 and called it good. Here's my dhcpd.conf
+for it. You'll have to sniff the real transaction to get the appropriate vendor
+string values, but it turns out that you can use your media converter to do that:
+
+* Bridge eth0 and eth1 on your linux box:
+  brctl addbr br0
+  brctl addif br0 eth0
+  brctl addif br0 eth1
+
+Stick your sunrise WAN port into eth1, plug your media converter into eth0, and
+tcpdump the traffic as your sunrise box boots up:
+  # tcpdump -s0 -X -ni br0 port 67 or port 68
+
+You'll have to translate the vendor string into hex - I'll leave that as an exercise
+for the reader! The NNN:NNN at least for me were all numbers.
+
+host sunrise-voip { 
+        hardware ethernet 00:11:22:33:44:55;
+        fixed-address sunrise-voip.net.your-domain.com;
+        option domain-name-servers 212.98.37.128, 194.230.55.99;
+        #option vendor-string "\x01)http://acs.sunrise.ch:7547/ACS-server/ACS\x02\xNNNNNNNN:NNNNNNNNNN"
+        option vendor-string 01:29:68:74:74:70:3a:2f:2f:61:63:73:2e:73:75:6e:72:69:73:65:2e:63:68:3a:37:35:34:37:2f:41:43:53:2d:73:65:72:76:65:72:2f:41:43:53:02:11:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx;
+}
+
+
+3. Sunrise TV
+
+Actually you'll have to do the same tcpdump trick as before, to find out what
+sunrise's DHCP server is going to give your TV box. Again, here's my dhcpd.conf
+entry.
+
+host sunrise-iptv {
+        hardware ethernet 00:11:22:aa:bb:cc;
+        fixed-address sunrise-iptv.net.your-domain.com;
+        option domain-name-servers 212.98.37.128, 194.230.55.99;
+        #option vendor-string "TVSNNNNNNNNNNNjlhttps://webacs.iptv.ch/?config=32&mlpc=$PROVISIONING_CODE&mac=$MAC;http://webacs.iptv.ch/?config=30&mac=$MAC";
+        option vendor-string nn:nn:nn:nn:....;
+}
+
+Once you get the TV box set up, here are a couple of rules that you'll need to 
+add on your external-facing interface on eth0.10:
+
+iptables -A INPUT -i eth0.10 -p udp -s 194.230.109.1 --sport 1234 --dport 1234 -j ACCEPT
+iptables -A INPUT -i eth0.10 -p igmp -s 1.1.1.1 -j ACCEPT
+
+iptables -A FORWARD -i eth0.10 -p udp -s 194.230.109.1 --sport 1234 --dport 1234 -j ACCEPT
+# Assumes that your TV box is 10.0.0.100.
+iptables -A FORWARD -i eth0.10 -p udp --sport 10000 -d 10.0.0.100 -j ACCEPT
+
+You will need to run igmpproxy. Here's my igmpproxy.conf file:
+
+### igmpproxy.conf start
+quickleave
+phyint eth0.10 upstream  ratelimit 0  threshold 1
+        altnet 194.230.109.0/24
+
+phyint eth1 downstream  ratelimit 0  threshold 1
+### disable interfaces that you aren't using
+phyint eth0 disabled
+phyint eth2 disabled
+phyint eth3 disabled
+### igmpproxy.conf end
+
+At this point your Sunrise TV box ought to be able to boot up and to watch live TV.
+
+Watching recorded TV or pausing live TV and then pressing play later (which
+essentially means that you still go from live TV to recorded TV) means that
+you'll need some extra magic. You will need to have a little something that
+I whipped up, that munges RTSP headers on their way through.
+
+First you'll need to encourage RTSP traffic to be redirected to a local port on its
+way through:
+
+iptables -A PREROUTING -t nat -i eth1 -p tcp --dport 554 ! -d 10.0.0.0/8 -j REDIRECT --to-port 554
+
+Then you'll need to run rtsp.py in this directory. What this does is to it
+intercepts traffic from the TV box and strips out the IP address to which
+Sunrise thinks it needs to send RTSP traffic to your external IP address.
+Otherwise Sunrise would be told to send traffic to your RFC1918 network's
+address which clearly isn't going to work.
+
+It also adds PREROUTING rules on the fly so that when your external interface
+gets RTSP traffic that it knows where to send it to (i.e. to your Sunrise TV
+box). And once you are no longer watching recorded TV, those rules get removed.
+
